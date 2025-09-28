@@ -142,8 +142,96 @@ class TradingAlgoIn(BaseModel):
     riskControls: Optional[RiskControls] = None
     copyTrading: Optional[CopyTrading] = None
 
-# ---------- Planner (same as before) ----------
-# ... keep the build_90d_plan function here (unchanged) ...
+# ---------- Planner ----------
+async def build_90d_plan(payload: TradingAlgoIn) -> Dict[str, Any]:
+    if not payload.tokens:
+        raise HTTPException(400, "tokens[] required")
+
+    # Pick primary (first non-stablecoin if possible)
+    primary = next((t for t in payload.tokens if t.upper() not in ("USDC", "USDT", "DAI")), payload.tokens[0])
+
+    # Get market data
+    hist = await get_historical_prices(primary, days=120)
+    cur_price = await get_current_price(primary)
+    if cur_price is None:
+        raise HTTPException(502, f"No current price for {primary}")
+
+    prices = [float(x["price"]) for x in hist] if hist else []
+    if not prices:
+        prices = [cur_price]
+
+    px_now = cur_price
+    rsi14 = rsi(prices, 14)
+    volA = annualized_vol(prices) if len(prices) > 1 else None
+
+    total_usd = safe_float(payload.amount)
+    allocations = normalize_amounts(total_usd)
+
+    # Basic strategy flags
+    has_lp = any(b.kind.upper() == "AMM_LP" for b in payload.blocks)
+    has_twap = any(b.kind.upper() == "TWAP" for b in payload.blocks)
+    has_limits = any(b.kind.upper() == "LIMIT_ORDER" for b in payload.blocks)
+    if not (has_lp or has_twap or has_limits):
+        has_twap = True
+
+    days90 = days_list(90)
+
+    # TWAP plan
+    twap_plan: List[Dict[str, Any]] = []
+    if has_twap:
+        daily_usd = round(allocations["TWAP"] / 90.0, 2)
+        for day in days90:
+            twap_plan.append({
+                "date": day,
+                "action": "BUY_TWAP",
+                "symbol": primary.upper(),
+                "usd_amount": daily_usd,
+                "max_slippage_bps": 25
+            })
+
+    # LP maintenance
+    lp_plan: List[Dict[str, Any]] = []
+    if has_lp:
+        width = 0.25
+        lower, upper = px_now * (1 - width), px_now * (1 + width)
+        step_days = 7 if not (volA and volA > 1.0) else 5
+        for i, day in enumerate(days90):
+            if i % step_days == 0:
+                lp_plan.append({
+                    "date": day,
+                    "action": "LP_CHECK",
+                    "protocol": "UniswapV3",
+                    "pair": f"{primary.upper()}/USDC",
+                    "fee_tier_bps": 3000,
+                    "current_price_hint": round(px_now, 4),
+                    "active_range": {"lower": lower, "upper": upper}
+                })
+
+    # Risk snapshot
+    risk = {
+        "max_slippage_bps": payload.riskControls.maxSlippageBps if payload.riskControls else 30,
+        "stop_loss_pct": payload.riskControls.stopLossPct if payload.riskControls else -6,
+        "rsi_now": None if rsi14 is None else round(rsi14, 2),
+        "ann_vol_est": None if volA is None else round(volA, 3)
+    }
+
+    return {
+        "header": {
+            "algo_name": payload.name,
+            "primary_symbol": primary.upper(),
+            "now_price": round(px_now, 4),
+            "allocations_usd": allocations,
+            "signals_snapshot": {
+                "RSI14": risk["rsi_now"],
+                "ann_vol": risk["ann_vol_est"]
+            }
+        },
+        "twap_schedule": twap_plan,
+        "lp_maintenance": lp_plan,
+        "limit_orders": [],  # stub
+        "risk_controls": risk
+    }
+
 
 # ---------- Routes ----------
 @app.get("/health")
